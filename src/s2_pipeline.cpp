@@ -906,6 +906,16 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
     const bool need_fresh_kv = !kv_reuse ||
         model().kv_max_seq_len() < max_seq_len ||
         model().kv_max_seq_len() == 0;
+    const std::string cache_key = compute_prefill_cache_key(params, ref_codes, T_prompt);
+    const bool reuse_vram_prefill = !need_fresh_kv && keep_kv_on_gpu &&
+        prefill_cache_.valid && prefill_cache_.vram_resident &&
+        prefill_cache_.cache_key == cache_key &&
+        prefill_cache_.max_seq_len >= max_seq_len;
+
+    // A resident prefill is valid only while its original KV contents survive.
+    if (!reuse_vram_prefill) {
+        prefill_cache_.vram_resident = false;
+    }
 
     if (need_fresh_kv) {
         model().clear_kv_cache();
@@ -919,7 +929,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         kv_init_thread = std::thread([&]() {
             kv_init_ok = model().init_kv_cache(max_seq_len);
         });
-    } else {
+    } else if (!reuse_vram_prefill) {
         kv_init_thread = std::thread([&]() {
             model().reset_kv_cache();
         });
@@ -929,11 +939,11 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         vram_phase1_thread.join();
     }
     if (!vram_phase1_ok) {
-        kv_init_thread.join();
+        if (kv_init_thread.joinable()) kv_init_thread.join();
         return false;
     }
 
-    kv_init_thread.join();
+    if (kv_init_thread.joinable()) kv_init_thread.join();
     if (!kv_init_ok) {
         safe_print_error_ln("Pipeline error: init_kv_cache failed.");
         return false;
@@ -941,7 +951,6 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
 
     const auto kv_t1 = std::chrono::steady_clock::now();
 
-    const std::string cache_key = compute_prefill_cache_key(params, ref_codes, T_prompt);
     bool prefill_hit = false;
     StepResult cached_state;
 
@@ -949,7 +958,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         prefill_cache_.cache_key == cache_key &&
         prefill_cache_.max_seq_len >= max_seq_len)
     {
-        if (keep_kv_on_gpu && prefill_cache_.vram_resident) {
+        if (reuse_vram_prefill) {
             model().set_n_past(prefill_cache_.n_past);
             cached_state = prefill_cache_.state;
             prefill_hit = true;
@@ -1399,6 +1408,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     }
 
     CodecDecodeCacheScope codec_decode_cache_scope(codec());
+    prefill_cache_.vram_resident = false;
     model().clear_kv_cache();
 
     safe_print_ln("--- Pipeline Streaming Synthesize ---");
